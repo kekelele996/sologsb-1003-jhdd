@@ -5,7 +5,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
+  Languages, Link2, Loader2, MessageSquare, Pencil, RefreshCw, RotateCcw, RotateCw, Save, Search,
   Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
@@ -16,6 +16,7 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { analyzeBatchLocally, buildBatches, freshBatches, loadCheckCache, pruneCheckCache, saveCheckCache, termMatchesSegment, type CheckCache } from '@/lib/incremental-check'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
 import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -57,6 +58,12 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [checkCache, setCheckCache] = useState<CheckCache>({})
+  const [checkProgress, setCheckProgress] = useState<{ done: number; total: number } | null>(null)
+  const [checkNotice, setCheckNotice] = useState<string | null>(null)
+  const [editingTermId, setEditingTermId] = useState<string | null>(null)
+  const [editingTermTarget, setEditingTermTarget] = useState('')
+  const checkCancelRef = useRef(false)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -86,17 +93,52 @@ export function LocalizationWorkbench() {
     initialData: seedConflicts,
   })
 
-  const checkMutation = useMutation({
-    mutationFn: async () => {
-      const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments, glossary }) })
-      if (!response.ok) throw new Error('check failed')
-      return response.json() as Promise<{ checkedAt: number; issues: TranslationIssue[] }>
-    },
-    onSuccess: (data) => {
-      setCheckedIssues(data.issues)
-      setFilter('issues')
-    },
-  })
+  const runIncrementalCheck = async () => {
+    if (checkProgress) return
+    const snapshotSegments = clone(segments)
+    const snapshotGlossary = clone(glossary)
+    const batches = buildBatches(snapshotSegments, snapshotGlossary)
+    const cache = pruneCheckCache(loadCheckCache(), batches)
+    const collected: TranslationIssue[] = []
+    let reused = 0
+    let rechecked = 0
+    checkCancelRef.current = false
+    setCheckNotice(null)
+    setCheckProgress({ done: 0, total: batches.length })
+    for (const batch of batches) {
+      if (checkCancelRef.current) break
+      const cached = cache[batch.id]
+      if (cached && cached.fingerprint === batch.fingerprint) {
+        collected.push(...cached.issues)
+        reused += 1
+      } else {
+        const batchSegments = snapshotSegments.filter((segment) => batch.segmentIds.includes(segment.id))
+        let issues: TranslationIssue[]
+        try {
+          const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments: batchSegments, glossary: snapshotGlossary }) })
+          if (!response.ok) throw new Error('check failed')
+          issues = (await response.json() as { issues: TranslationIssue[] }).issues
+        } catch {
+          issues = analyzeBatchLocally(batchSegments, snapshotGlossary)
+        }
+        cache[batch.id] = { fingerprint: batch.fingerprint, issues, checkedAt: Date.now() }
+        saveCheckCache(cache)
+        setCheckCache({ ...cache })
+        collected.push(...issues)
+        rechecked += 1
+      }
+      setCheckProgress((current) => current ? { ...current, done: current.done + 1 } : current)
+    }
+    const cancelled = checkCancelRef.current
+    setCheckProgress(null)
+    if (cancelled) {
+      setCheckNotice(`已取消：完成 ${reused + rechecked}/${batches.length} 批，已查批次已保存，下次点击继续。`)
+      return
+    }
+    setCheckedIssues(collected)
+    setFilter('issues')
+    setCheckNotice(rechecked ? `检查完成：复用缓存 ${reused} 批，重新检查 ${rechecked} 批。` : `检查完成：${reused} 批全部命中缓存，无需重新检查。`)
+  }
   const saveMutation = useMutation({
     mutationFn: async () => {
       const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions }) })
@@ -118,6 +160,9 @@ export function LocalizationWorkbench() {
 
   const liveIssues = useMemo(() => analyzeDocument(segments, glossary), [segments, glossary])
   const issues = checkedIssues ?? liveIssues
+  const checkBatches = useMemo(() => buildBatches(segments, glossary), [segments, glossary])
+  const freshBatchCount = useMemo(() => freshBatches(checkBatches, checkCache).length, [checkBatches, checkCache])
+  const staleBatchCount = checkBatches.length - freshBatchCount
   const issueMap = useMemo(() => issues.reduce<Record<string, TranslationIssue[]>>((map, issue) => {
     map[issue.segmentId] = [...(map[issue.segmentId] ?? []), issue]
     return map
@@ -159,6 +204,21 @@ export function LocalizationWorkbench() {
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
   }, [discussions, glossary, history, hydrated, segments])
 
+  // 页面崩溃或刷新后，从本地缓存恢复已查完的批次，指纹未变的批次无需重查。
+  useEffect(() => {
+    if (!hydrated) return
+    const cache = loadCheckCache()
+    setCheckCache(cache)
+    const recovered = freshBatches(buildBatches(segments, glossary), cache)
+    if (recovered.length) {
+      setCheckedIssues(recovered.flatMap((batch) => cache[batch.id].issues))
+      const total = buildBatches(segments, glossary).length
+      if (recovered.length < total) setCheckNotice(`已从本地恢复 ${recovered.length}/${total} 个批次的检查结果，其余批次下次检查时重查。`)
+    }
+    // 仅在草稿水合完成后恢复一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated])
+
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (!dirty) return
@@ -192,6 +252,23 @@ export function LocalizationWorkbench() {
     replaceState({ segments: next, discussions: clone(discussions) })
     pushHistoryEntry(segmentId, action, segment.targetText, segment.targetText)
     setSelectedForReturn((current) => { const copy = new Set(current); copy.delete(segmentId); return copy })
+  }
+  const updateGlossaryTerm = (termId: string, target: string) => {
+    const term = glossary.find((item) => item.id === termId)
+    const nextTarget = target.trim()
+    setEditingTermId(null)
+    if (!term || !nextTarget || nextTarget === term.target) return
+    setGlossary((current) => current.map((item) => item.id === termId ? { ...item, target: nextTarget } : item))
+    // 引用该术语的已确认片段需要重新确认；指纹变化会让对应批次在下次检查时重查。
+    const affected = segments.filter((segment) => segment.status === 'confirmed' && termMatchesSegment(term, segment))
+    if (affected.length) {
+      const affectedIds = new Set(affected.map((segment) => segment.id))
+      setSegments((current) => current.map((segment) => affectedIds.has(segment.id) ? { ...segment, status: 'needs-work' as const } : segment))
+      affected.forEach((segment) => pushHistoryEntry(segment.id, 'glossary-update', term.target, `术语“${term.source}”译法改为“${nextTarget}”，需重新确认`, '术语表'))
+    }
+    setCheckedIssues(null)
+    setCheckNotice(affected.length ? `术语“${term.source}”译法已更新，${affected.length} 个已确认片段退回待确认。` : `术语“${term.source}”译法已更新，引用它的批次将在下次检查时重查。`)
+    setDirty(true)
   }
   const undo = () => {
     const previous = past.at(-1)
@@ -322,8 +399,18 @@ export function LocalizationWorkbench() {
           <span className="flex items-center gap-1"><CircleAlert className="h-3.5 w-3.5 text-amber-600" /><b className="text-slate-900">{issues.length}</b> 个检查结果</span>
           <span className="flex items-center gap-1"><CheckCheck className="h-3.5 w-3.5 text-emerald-600" /><b className="text-slate-900">{confirmedCount}</b> 已确认</span>
           <div className="ml-auto flex min-w-[220px] items-center gap-3"><span>审校进度 {progress}%</span><Progress value={progress} className="w-36" /></div>
-          <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}运行本地术语检查</Button>
+          {staleBatchCount > 0 && !checkProgress && <span className="flex items-center gap-1 text-amber-600"><RefreshCw className="h-3.5 w-3.5" /><b>{staleBatchCount}</b>/{checkBatches.length} 批待重查</span>}
+          {checkProgress ? (
+            <span className="flex items-center gap-2">
+              <Progress value={(checkProgress.done / Math.max(1, checkProgress.total)) * 100} className="w-28" />
+              <span className="text-slate-600">检查中 {checkProgress.done}/{checkProgress.total} 批</span>
+              <Button size="sm" variant="outline" onClick={() => { checkCancelRef.current = true }}>取消</Button>
+            </span>
+          ) : (
+            <Button size="sm" variant="secondary" onClick={() => void runIncrementalCheck()}><ShieldCheck className="h-4 w-4" />运行本地术语检查</Button>
+          )}
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
+          {checkNotice && <span className="flex items-center gap-1 text-slate-500"><Check className="h-3.5 w-3.5 text-emerald-600" />{checkNotice}</span>}
         </div>
       </div>
 
@@ -332,7 +419,18 @@ export function LocalizationWorkbench() {
           <Card>
             <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
             <CardContent className="space-y-2">
-              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
+              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" />{editingTermId === term.id ? (
+                <span className="flex min-w-0 items-center gap-1">
+                  <Input value={editingTermTarget} onChange={(event) => setEditingTermTarget(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') updateGlossaryTerm(term.id, editingTermTarget); if (event.key === 'Escape') setEditingTermId(null) }} className="h-6 w-28 px-1.5 text-xs" autoFocus />
+                  <button aria-label="保存术语译法" className="text-emerald-600 hover:text-emerald-700" onClick={() => updateGlossaryTerm(term.id, editingTermTarget)}><Check className="h-3.5 w-3.5" /></button>
+                  <button aria-label="取消编辑" className="text-slate-400 hover:text-slate-600" onClick={() => setEditingTermId(null)}><X className="h-3.5 w-3.5" /></button>
+                </span>
+              ) : (
+                <span className="flex min-w-0 items-center gap-1">
+                  <span className="truncate text-xs font-semibold text-blue-700">{term.target}</span>
+                  <button aria-label={`编辑术语 ${term.source} 的译法`} title="编辑译法" className="shrink-0 text-slate-300 hover:text-blue-600" onClick={() => { setEditingTermId(term.id); setEditingTermTarget(term.target) }}><Pencil className="h-3 w-3" /></button>
+                </span>
+              )}</div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
             </CardContent>
           </Card>
 
