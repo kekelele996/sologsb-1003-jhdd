@@ -5,8 +5,8 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
-  Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
+  Languages, Link2, Loader2, MessageSquare, Pencil, Plus, RefreshCw, RotateCw,
+  Save, Search, Send, ShieldCheck, Sparkles, Square, Trash2, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,12 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import {
+  CHECK_BATCH_SIZE, chunk, clearCheckState, countFreshSegments, glossaryFingerprint,
+  liveIssuesForSegment, loadCheckState, planDirtySegments, reconcileCheckState,
+  saveCheckState, segmentFingerprint, type SegmentCheckResult,
+} from '@/lib/check-engine'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
 import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -38,6 +43,21 @@ interface EditorSnapshot {
   discussions: Discussion[]
 }
 
+function TermForm({ draft, onChange, onSave, onCancel }: { draft: GlossaryTerm; onChange: (term: GlossaryTerm) => void; onSave: () => void; onCancel: () => void }) {
+  return (
+    <div className="space-y-2 rounded-lg border border-blue-300 bg-blue-50/60 p-2.5">
+      <Input value={draft.source} onChange={(event) => onChange({ ...draft, source: event.target.value })} placeholder="源文术语，如 operator" className="h-8 text-xs" />
+      <Input value={draft.target} onChange={(event) => onChange({ ...draft, target: event.target.value })} placeholder="规范译文，如 Operator" className="h-8 text-xs" />
+      <Input value={draft.note} onChange={(event) => onChange({ ...draft, note: event.target.value })} placeholder="备注（可选）" className="h-8 text-xs" />
+      <label className="flex items-center gap-1.5 text-[10px] text-slate-600"><input type="checkbox" checked={draft.caseSensitive} onChange={(event) => onChange({ ...draft, caseSensitive: event.target.checked })} className="h-3.5 w-3.5 accent-blue-600" />区分大小写</label>
+      <div className="flex gap-2">
+        <Button size="sm" className="h-7 text-xs" onClick={onSave} disabled={!draft.source.trim() || !draft.target.trim()}>保存</Button>
+        <Button size="sm" variant="outline" className="h-7 text-xs" onClick={onCancel}>取消</Button>
+      </div>
+    </div>
+  )
+}
+
 export function LocalizationWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null)
   const [segments, setSegments] = useState<Segment[]>(seedSegments)
@@ -45,11 +65,19 @@ export function LocalizationWorkbench() {
   const [discussions, setDiscussions] = useState<Discussion[]>(seedDiscussions)
   const [history, setHistory] = useState<HistoryEntry[]>(seedHistory)
   const [conflicts, setConflicts] = useState<TranslationConflict[]>(seedConflicts)
-  const [checkedIssues, setCheckedIssues] = useState<TranslationIssue[] | null>(null)
+  // 增量分批检查：checkResults 按片段 id 缓存每片段的指纹与检查结果，崩溃后从 localStorage 恢复
+  const [checkResults, setCheckResults] = useState<Record<string, SegmentCheckResult>>({})
+  const [checkRun, setCheckRun] = useState<{ batch: number; totalBatches: number; done: number; total: number } | null>(null)
+  const [checkError, setCheckError] = useState<string | null>(null)
+  const cancelCheckRef = useRef(false)
+  const segmentsRef = useRef(segments)
+  const glossaryRef = useRef(glossary)
   const [selectedSegmentId, setSelectedSegmentId] = useState('seg-05')
   const [mode, setMode] = useState<'translate' | 'review'>('translate')
   const [filter, setFilter] = useState<'all' | 'issues' | 'untranslated' | 'confirmed'>('all')
   const [glossarySearch, setGlossarySearch] = useState('')
+  const [editingTermId, setEditingTermId] = useState<string | null>(null)
+  const [draftTerm, setDraftTerm] = useState<GlossaryTerm>({ id: '', source: '', target: '', caseSensitive: false, note: '' })
   const [discussionDraft, setDiscussionDraft] = useState('')
   const [selectedForReturn, setSelectedForReturn] = useState<Set<string>>(new Set())
   const [returnReason, setReturnReason] = useState('请根据术语表修改后重新提交。')
@@ -86,17 +114,62 @@ export function LocalizationWorkbench() {
     initialData: seedConflicts,
   })
 
-  const checkMutation = useMutation({
-    mutationFn: async () => {
-      const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments, glossary }) })
-      if (!response.ok) throw new Error('check failed')
-      return response.json() as Promise<{ checkedAt: number; issues: TranslationIssue[] }>
-    },
-    onSuccess: (data) => {
-      setCheckedIssues(data.issues)
-      setFilter('issues')
-    },
-  })
+  // 分批检查：只请求指纹失效（或从未检查）的片段，每批 CHECK_BATCH_SIZE 个，
+  // 每批完成后立即落盘；页面崩溃后重开可从已完成批次续查。
+  const runChecks = async (force = false) => {
+    if (checkRun) return
+    setCheckError(null)
+    cancelCheckRef.current = false
+    const currentSegments = segmentsRef.current
+    const currentGlossary = glossaryRef.current
+    const dirty = planDirtySegments(currentSegments, currentGlossary, checkResults, force)
+    const batches = chunk(dirty, CHECK_BATCH_SIZE)
+    const nextResults: Record<string, SegmentCheckResult> = { ...checkResults }
+    // 已确认片段直接标记为最新（分析时本就跳过），不占批次请求
+    for (const segment of currentSegments) {
+      if (segment.status === 'confirmed') {
+        nextResults[segment.id] = { segmentId: segment.id, fingerprint: segmentFingerprint(segment, currentGlossary), issues: [], checkedAt: Date.now() }
+      }
+    }
+    setCheckRun({ batch: 0, totalBatches: batches.length, done: 0, total: dirty.length })
+    saveCheckState({ version: 1, documentId: seedDocument.id, results: nextResults, updatedAt: Date.now() })
+    for (let i = 0; i < batches.length; i++) {
+      if (cancelCheckRef.current) break
+      const batch = batches[i]
+      setCheckRun({ batch: i + 1, totalBatches: batches.length, done: Math.min(i * CHECK_BATCH_SIZE, dirty.length), total: dirty.length })
+      try {
+        const response = await fetch('/api/check-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ documentId: seedDocument.id, segments: batch, glossary: currentGlossary }),
+        })
+        if (!response.ok) throw new Error(`第 ${i + 1} 批检查失败`)
+        const data = await response.json() as { checkedAt: number; results: { segmentId: string; issues: TranslationIssue[] }[] }
+        for (const result of data.results) {
+          const segment = segmentsRef.current.find((item) => item.id === result.segmentId) ?? batch.find((item) => item.id === result.segmentId)
+          if (!segment) continue
+          nextResults[segment.id] = {
+            segmentId: segment.id,
+            fingerprint: segmentFingerprint(segment, glossaryRef.current),
+            issues: result.issues,
+            checkedAt: data.checkedAt,
+          }
+        }
+        setCheckResults({ ...nextResults })
+        saveCheckState({ version: 1, documentId: seedDocument.id, results: { ...nextResults }, updatedAt: Date.now() })
+      } catch (error) {
+        setCheckError(error instanceof Error ? error.message : '检查失败')
+        setCheckRun(null)
+        saveCheckState({ version: 1, documentId: seedDocument.id, results: { ...nextResults }, updatedAt: Date.now() })
+        return
+      }
+    }
+    setCheckRun(null)
+  }
+  const cancelChecks = () => {
+    cancelCheckRef.current = true
+    setCheckRun(null)
+  }
   const saveMutation = useMutation({
     mutationFn: async () => {
       const response = await fetch('/api/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ documentId: seedDocument.id, segments, discussions }) })
@@ -116,8 +189,26 @@ export function LocalizationWorkbench() {
     },
   })
 
-  const liveIssues = useMemo(() => analyzeDocument(segments, glossary), [segments, glossary])
-  const issues = checkedIssues ?? liveIssues
+  // 检查结果优先取已完成批次的缓存；指纹失效（译文/状态/引用术语变动）的片段只重算这一片段，
+  // 未确认片段不参与检查（与 analyzeDocument 的行为一致）。
+  const issues = useMemo(() => {
+    const list: TranslationIssue[] = []
+    for (const segment of segments) {
+      if (segment.status === 'confirmed') continue
+      const cached = checkResults[segment.id]
+      if (cached && cached.fingerprint === segmentFingerprint(segment, glossary)) {
+        list.push(...cached.issues)
+      } else {
+        list.push(...liveIssuesForSegment(segment, glossary))
+      }
+    }
+    return list
+  }, [segments, glossary, checkResults])
+  const freshCount = countFreshSegments(segments, glossary, checkResults)
+  const dirtyCount = segments.length - freshCount
+
+  useEffect(() => { segmentsRef.current = segments }, [segments])
+  useEffect(() => { glossaryRef.current = glossary }, [glossary])
   const issueMap = useMemo(() => issues.reduce<Record<string, TranslationIssue[]>>((map, issue) => {
     map[issue.segmentId] = [...(map[issue.segmentId] ?? []), issue]
     return map
@@ -139,18 +230,34 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (hydrated) return
+    let nextSegments = seedSegments
+    let nextDiscussions = seedDiscussions
+    let nextGlossary = seedGlossary
+    let nextHistory = seedHistory
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
         const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
         if (draft.segments?.length) {
-          setSegments(draft.segments)
-          setDiscussions(draft.discussions ?? seedDiscussions)
-          setGlossary(draft.glossary ?? seedGlossary)
-          setHistory(draft.history ?? seedHistory)
+          nextSegments = draft.segments
+          nextDiscussions = draft.discussions ?? seedDiscussions
+          nextGlossary = draft.glossary ?? seedGlossary
+          nextHistory = draft.history ?? seedHistory
         }
       }
     } catch { /* start from seed */ }
+    setSegments(nextSegments)
+    setDiscussions(nextDiscussions)
+    setGlossary(nextGlossary)
+    setHistory(nextHistory)
+    // 恢复已完成的检查批次，并丢弃指纹已失效的缓存；剩余未查片段在下次点击检查时续查
+    try {
+      const checkState = loadCheckState(seedDocument.id)
+      if (checkState) {
+        const reconciled = reconcileCheckState(checkState, nextSegments, nextGlossary)
+        setCheckResults(reconciled.results)
+      }
+    } catch { /* 没有可用的检查缓存 */ }
     setHydrated(true)
   }, [hydrated])
 
@@ -178,7 +285,6 @@ export function LocalizationWorkbench() {
     setFuture([])
     setSegments(next.segments)
     setDiscussions(next.discussions)
-    setCheckedIssues(null)
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
@@ -200,7 +306,6 @@ export function LocalizationWorkbench() {
     setPast((current) => current.slice(0, -1))
     setSegments(previous.segments)
     setDiscussions(previous.discussions)
-    setCheckedIssues(null)
     setDirty(true)
   }
   const redo = () => {
@@ -210,7 +315,6 @@ export function LocalizationWorkbench() {
     setFuture((current) => current.slice(1))
     setSegments(next.segments)
     setDiscussions(next.discussions)
-    setCheckedIssues(null)
     setDirty(true)
   }
   const selectAndScroll = (segmentId: string) => {
@@ -254,6 +358,8 @@ export function LocalizationWorkbench() {
     const imported = parseMarkdown(await file.text())
     if (!imported.length) return
     replaceState({ segments: imported, discussions: [] })
+    setCheckResults({})
+    clearCheckState(seedDocument.id)
     pushHistoryEntry(imported[0].id, 'import', '', file.name)
     setSelectedSegmentId(imported[0].id)
     event.target.value = ''
@@ -273,6 +379,27 @@ export function LocalizationWorkbench() {
       next.has(segmentId) ? next.delete(segmentId) : next.add(segmentId)
       return next
     })
+  }
+  const startAddTerm = () => {
+    setEditingTermId('new')
+    setDraftTerm({ id: '', source: '', target: '', caseSensitive: false, note: '' })
+  }
+  const startEditTerm = (term: GlossaryTerm) => {
+    setEditingTermId(term.id)
+    setDraftTerm({ ...term })
+  }
+  const saveDraftTerm = () => {
+    if (!draftTerm.source.trim() || !draftTerm.target.trim()) return
+    if (editingTermId === 'new') {
+      setGlossary((current) => [...current, { ...draftTerm, id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }])
+    } else {
+      setGlossary((current) => current.map((term) => term.id === editingTermId ? { ...draftTerm, id: editingTermId } : term))
+    }
+    setEditingTermId(null)
+  }
+  const removeTerm = (termId: string) => {
+    setGlossary((current) => current.filter((term) => term.id !== termId))
+    if (editingTermId === termId) setEditingTermId(null)
   }
 
   useEffect(() => {
@@ -321,8 +448,26 @@ export function LocalizationWorkbench() {
           <span><b className="text-slate-900">{translatedCount}</b> 已翻译</span>
           <span className="flex items-center gap-1"><CircleAlert className="h-3.5 w-3.5 text-amber-600" /><b className="text-slate-900">{issues.length}</b> 个检查结果</span>
           <span className="flex items-center gap-1"><CheckCheck className="h-3.5 w-3.5 text-emerald-600" /><b className="text-slate-900">{confirmedCount}</b> 已确认</span>
+          <span className="flex items-center gap-1" title="按片段内容与术语表版本生成指纹，只重查指纹变动或从未检查的片段；已完成的批次保存在本地，页面崩溃后重开可续查。">
+            <ShieldCheck className="h-3.5 w-3.5 text-blue-600" />检查缓存 <b className="text-slate-900">{freshCount}</b>/{segments.length}
+            {dirtyCount > 0 && <span className="text-amber-700">· 待重查 {dirtyCount}</span>}
+          </span>
           <div className="ml-auto flex min-w-[220px] items-center gap-3"><span>审校进度 {progress}%</span><Progress value={progress} className="w-36" /></div>
-          <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}运行本地术语检查</Button>
+          {checkRun ? (
+            <div className="flex items-center gap-2">
+              <Progress value={checkRun.total ? (checkRun.done / checkRun.total) * 100 : 0} className="w-24" />
+              <span className="whitespace-nowrap text-[11px] text-slate-600">第 {checkRun.batch}/{Math.max(1, checkRun.totalBatches)} 批 · {checkRun.done}/{checkRun.total}</span>
+              <Button size="sm" variant="outline" onClick={cancelChecks}><Square className="h-3.5 w-3.5" />停止</Button>
+            </div>
+          ) : (
+            <>
+              <Button size="sm" variant="secondary" onClick={() => void runChecks()} disabled={!dirtyCount}>
+                <ShieldCheck className="h-4 w-4" />运行本地术语检查{dirtyCount > 0 ? `（${dirtyCount}）` : ''}
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void runChecks(true)} title="忽略指纹缓存，重新分批检查全部未确认片段">全部重查</Button>
+            </>
+          )}
+          {checkError && <span className="text-[11px] text-red-600">{checkError}，已保存完成的批次</span>}
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
         </div>
       </div>
@@ -330,9 +475,32 @@ export function LocalizationWorkbench() {
       <main className="workbench-grid mx-auto grid max-w-[1800px] grid-cols-[270px_minmax(620px,1fr)_340px] gap-4 p-4 lg:p-5">
         <aside className="workbench-left space-y-4">
           <Card>
-            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge>
+                <button className="ml-auto flex items-center gap-1 text-[11px] font-normal text-blue-600 hover:underline" onClick={startAddTerm}><Plus className="h-3 w-3" />添加术语</button>
+              </CardTitle>
+              <p className="mt-1 text-[10px] text-slate-400">术语表版本 <code className="rounded bg-slate-100 px-1">{glossaryFingerprint(glossary).slice(0, 10)}</code> · 修改译法后，引用该术语的片段会自动重查</p>
+              <div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div>
+            </CardHeader>
             <CardContent className="space-y-2">
-              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
+              {filteredGlossary.map((term) => editingTermId === term.id ? (
+                <TermForm key={term.id} draft={draftTerm} onChange={setDraftTerm} onSave={saveDraftTerm} onCancel={() => setEditingTermId(null)} />
+              ) : (
+                <div key={term.id} className="group rounded-lg border bg-slate-50/70 p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-800">{term.source}</span>
+                    <div className="flex items-center gap-1">
+                      <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
+                      <span className="text-xs font-semibold text-blue-700">{term.target}</span>
+                      <button className="rounded p-0.5 text-slate-400 opacity-0 transition hover:bg-slate-200 hover:text-slate-700 group-hover:opacity-100" onClick={() => startEditTerm(term)} aria-label={`编辑术语 ${term.source}`}><Pencil className="h-3 w-3" /></button>
+                      <button className="rounded p-0.5 text-slate-400 opacity-0 transition hover:bg-red-100 hover:text-red-600 group-hover:opacity-100" onClick={() => removeTerm(term.id)} aria-label={`删除术语 ${term.source}`}><Trash2 className="h-3 w-3" /></button>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p>
+                </div>
+              ))}
+              {editingTermId === 'new' && <TermForm draft={draftTerm} onChange={setDraftTerm} onSave={saveDraftTerm} onCancel={() => setEditingTermId(null)} />}
             </CardContent>
           </Card>
 
